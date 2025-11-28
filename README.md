@@ -1,156 +1,310 @@
----
+# Netkiller Google Workspace Provisioning Script
 
-# Google Workspace Reseller — End-to-End Customer Provisioning (Colab)
-
-## 개요
-
-이 Colab 노트북은 **Google Workspace Reseller API**, **Admin SDK (Directory API)**, **Site Verification API**를 이용하여
-신규 고객 도메인을 자동으로 프로비저닝(생성 및 설정)하는 과정을 단계별로 실행할 수 있게 구성되었습니다.
-
-참고: [공식 Google Codelab - End-to-End Customer Provisioning](https://developers.google.com/workspace/admin/reseller/v1/codelab/end-to-end)
+Google Workspace Reseller API와 Directory API를 이용해
+**고객(테넌트) 생성 → 구독 생성(TRIAL 우선) → (옵션) 관리자 사용자 생성/승격 → 결과 기록 → (옵션) 플랜 전환/유료 시작/갱신설정 → 안내 메일 발송**
+을 스프레드시트 기반으로 자동 처리하는 Apps Script입니다.
 
 ---
 
-## 주요 기능
+## 1. 주요 기능
 
-| 기능                    | 설명                                     |
-| --------------------- | -------------------------------------- |
-| Site Verification API | 신규 고객 도메인의 DNS/META 토큰 생성 및 인증         |
-| Reseller API          | Customer(고객) 및 Subscription(구독) 생성     |
-| Directory API         | 첫 사용자(admin 계정) 생성 및 Super Admin 권한 부여 |
-| 자동화 흐름                | 고객 → 사용자 → 구독 → 인증 절차를 순차적으로 수행        |
+### 1) 고객/구독 프로비저닝
 
----
+* `Provisioning` 시트 각 행을 CONFIG로 변환하여 실행
+* 고객이 없으면 생성, 있으면 재사용
+* 구독은 **TRIAL 생성 시도 → 실패 시 FLEXIBLE로 폴백**
 
-## 사전 준비사항
+  * FLEXIBLE 폴백 시 seats 전송 금지 로직 포함
 
-1. **Google Workspace 리셀러 계정**
+### 2) SKU 매핑 지원
 
-   * 파트너 자격을 가진 Workspace 리셀러만 실행 가능
+* `skuId`가 없고 `skuName`만 있을 때
+  `SKU_MAP` 시트에서 **skuName → skuId 자동 변환**
+* SKU_MAP 시트가 없으면 자동 생성 + 기본값 삽입
 
-2. **Google Cloud 프로젝트 설정**
+### 3) 언어 설정(테넌트/사용자)
 
-   * 아래 API들을 사용 설정(Enable)해야 함:
+* `language` 또는 `언어` 컬럼을 읽어
 
-     * Reseller API → `reseller.googleapis.com`
-     * Site Verification API → `siteverification.googleapis.com`
-     * Admin SDK → `admin.googleapis.com`
+  * 고객 기본 언어(`AdminDirectory.Customers.update`)
+  * 생성 관리자 계정 UI 언어(`AdminDirectory.Users.insert.languages`)
+    에 반영
 
-3. **서비스 계정 생성 및 도메인 전체 위임 (Domain-wide Delegation)**
+### 4) 결과 자동 기록
 
-   * Google Cloud Console → IAM & Admin → Service Accounts
-   * "Enable G Suite Domain-wide Delegation" 체크
-   * 키(JSON) 생성 후 Colab에 업로드
+프로비저닝/조회 결과를 시트에 자동 저장:
 
-4. **관리자 콘솔에 서비스 계정 등록**
+* `customerId`
+* `subscriptionId`
+* `currentPlan`
+* `currentStatus`
+* `trialEndTime`
 
-   * Admin Console → 보안 → API 컨트롤 → 도메인 전체 위임 관리
-   * 클라이언트 ID 등록 후, 다음 OAuth 범위를 입력:
+### 5) 전체 플랜 전환 자동화
 
-     ```
-     https://www.googleapis.com/auth/apps.order,
-     https://www.googleapis.com/auth/admin.directory.user,
-     https://www.googleapis.com/auth/admin.directory.user.security,
-     https://www.googleapis.com/auth/siteverification
-     ```
+* TRIAL/FLEX → ANNUAL 전환(changePlan)
+* TRIAL이면 전환 직후 startPaidService 호출
+* renewalType(AUTO_RENEW 등) 설정
 
----
+### 6) 설정 안내 메일 발송
 
-## 노트북 실행 단계 요약
-
-| 단계                                 | 설명                                                                                           |
-| ---------------------------------- | -------------------------------------------------------------------------------------------- |
-| 1. 라이브러리 설치                        | `google-api-python-client`, `google-auth`, `google-auth-httplib2`, `google-auth-oauthlib` 설치 |
-| 2. 서비스 계정 JSON 업로드                 | 업로드 및 형식 검증 수행                                                                               |
-| 3. 구성 변수 설정                        | 도메인, 이메일, 주소, SKU, 플랜 정보 입력                                                                  |
-| 4. 인증 및 클라이언트 생성                   | Credentials 객체 생성, `reseller`, `sitever`, `directory` 클라이언트 빌드                               |
-| 5. Site Verification 토큰 생성         | DNS TXT 또는 META 태그 방식으로 도메인 인증 토큰 발급                                                         |
-| 6. Customer 생성 (Reseller API)      | 고객 도메인 등록 및 기본 연락처 정보 설정                                                                     |
-| 7. 첫 사용자(Admin) 생성 (Directory API) | `admin@도메인` 생성 및 Super Admin 권한 부여                                                           |
-| 8. Subscription 생성 (Reseller API)  | SKU, 플랜, 좌석수 지정하여 구독 등록                                                                      |
-| 9. 도메인 최종 인증 (Site Verification)   | DNS/META 토큰 적용 후 인증 완료                                                                       |
+선택된 고객 행에 대해 DNS/CNAME/MX/SPF + 관리자 계정 정보 포함 안내 메일 자동 발송
 
 ---
 
-## 예시 값
+## 2. 사전 준비사항
 
-```python
-DELEGATED_ADMIN_EMAIL = "laika.jang@netkillersoft.com"
-CUSTOMER_DOMAIN = "laikacreate.netkiller-gws.com"
-ALTERNATE_EMAIL = "owner@laikacreate.betanetkillersoft.com"
-CUSTOMER_PHONE = "+82-2-0000-0000"
-POSTAL_ADDRESS = {
-    "contactName": "Laika Jang",
-    "organizationName": "New Customer Inc.",
-    "postalCode": "04524",
-    "region": "Seoul",
-    "countryCode": "KR",
-    "locality": "Jung-gu",
-    "addressLine1": "123 Example-ro"
-}
-PRIMARY_ADMIN_EMAIL = "admin@" + CUSTOMER_DOMAIN
-PRIMARY_ADMIN_PASSWORD = "TempPass!234"
-SKU_ID = "1010020027"  # Google Workspace Business Starter
-PLAN = "TRIAL"
-SEAT_NUMBER = 1
+### 2.1 Advanced Google Services 활성화
+
+Apps Script 편집기에서
+**Services(서비스)** → Advanced Google services 활성화:
+
+* **Admin Directory API**
+* **Google Workspace Reseller API**
+
+또한 Google Cloud Console에서 동일 API가 활성화되어 있어야 합니다.
+
+### 2.2 OAuth2 라이브러리 추가 (Site Verification)
+
+Site Verification 토큰 발급 기능을 쓰려면 OAuth2 라이브러리를 추가합니다.
+
+* 라이브러리 ID 예: `1B7...` (Google OAuth2 for Apps Script)
+* 코드 상에서는 `OAuth2.createService(...)` 사용
+
+### 2.3 Script Properties 설정
+
+`CLIENT_ID`, `CLIENT_SECRET` 을 Script Properties에 저장해야 Site Verification이 동작합니다.
+
+* Apps Script → Project Settings → Script properties
+
+  * `CLIENT_ID`
+  * `CLIENT_SECRET`
+
+### 2.4 delegatedAdmin(대리 관리자) 계정
+
+코드 상 기본값:
+
+```js
+const DEFAULT_ALT_EMAIL = 'laika.jang@netkillersoft.com';
 ```
 
----
-
-## 주의 사항
-
-* Site Verification 후 도메인 전파에 몇 분~몇 시간이 걸릴 수 있습니다.
-* `customerDomainVerified` 값이 `false`라도 실제 인증 완료 후 자동 갱신됩니다.
-* Trial 구독 생성 시 `"status": "SUSPENDED"` 및 `"PENDING_TOS_ACCEPTANCE"`는 정상입니다.
-  고객이 Admin Console 첫 로그인 시 약관을 수락하면 `"ACTIVE"` 상태로 전환됩니다.
+* Reseller API 호출 가능한 Netkiller 파트너 계정이어야 함
+* 고객 생성 시 alternateEmail로 등록됨
 
 ---
 
-## 오류 해결 가이드
+## 3. 스프레드시트 구조
 
-| 오류 메시지                                                   | 원인                             | 해결                                                         |
-| -------------------------------------------------------- | ------------------------------ | ---------------------------------------------------------- |
-| `MalformedError: missing fields token_uri, client_email` | 업로드한 파일이 서비스 계정 JSON이 아님       | Cloud Console에서 JSON 키 재발급                                 |
-| `403 accessNotConfigured`                                | API 미사용 또는 비활성화                | 해당 프로젝트에서 API 사용 설정                                        |
-| `400 Required field must not be blank`                   | `postalAddress.contactName` 누락 | POSTAL_ADDRESS에 `contactName` 추가                           |
-| `409 Resource already exists`                            | 이미 존재하는 고객                     | 기존 `customerId` 사용                                         |
-| `400 Invalid Value`                                      | SKU ID 또는 seats 형식 오류          | SKU는 숫자 ID(`1010020027`), seats는 `maximumNumberOfSeats` 사용 |
-| `SUSPENDED: PENDING_TOS_ACCEPTANCE`                      | 약관 미수락                         | 고객이 admin 계정으로 로그인 후 약관 수락                                 |
+### 3.1 필수 시트
+
+* `Provisioning`
+* `SKU_MAP` (없으면 자동 생성)
+
+### 3.2 Provisioning 시트 헤더(필수/권장)
+
+| 헤더             |            필수 | 설명                                 |
+| -------------- | ------------: | ---------------------------------- |
+| customerDomain |             ✅ | 고객 도메인 (예: example.com)            |
+| skuId          | ✅(또는 skuName) | Workspace SKU ID                   |
+| skuName        |   ✅(또는 skuId) | SKU 이름 (SKU_MAP으로 매핑)              |
+| planName       |            권장 | TRIAL/FLEXIBLE/ANNUAL_* (기본 TRIAL) |
+| seats          |            권장 | 좌석 수 (기본 1)                        |
+| renewalType    |            선택 | AUTO_RENEW / CANCEL_AT_END 등       |
+| language / 언어  |            선택 | 테넌트/사용자 기본 언어 (기본 ko)              |
+
+#### 관리자 계정 생성 옵션 컬럼
+
+아래 4개가 모두 있으면 **관리자 사용자 자동 생성 + 슈퍼관리자 승격**
+
+| 헤더           | 설명          |
+| ------------ | ----------- |
+| primaryEmail | 생성할 관리자 이메일 |
+| givenName    | 이름          |
+| familyName   | 성           |
+| password     | 임시 비밀번호     |
+
+#### 안내 메일 발송 옵션 컬럼
+
+| 헤더           | 설명            |
+| ------------ | ------------- |
+| contactEmail | 안내 메일 수신자     |
+| host         | CNAME Host 값  |
+| value        | CNAME Value 값 |
+
+### 3.3 SKU_MAP 시트 헤더
+
+| skuName          | skuId      |
+| ---------------- | ---------- |
+| Business Starter | 1010020027 |
+| ...              | ...        |
+
+* skuName은 **대소문자 무시** 비교
+* 매핑이 없으면 오류 발생
 
 ---
 
-## 결과 확인
+## 4. 메뉴/실행 방법
 
-* 고객(Admin Console URL):
-  `https://admin.google.com/ac/home?ecid=<customerId>`
+스프레드시트 열면 상단에 `Netkiller` 메뉴가 생성됩니다.
 
-* 구독 관리 URL:
-  `https://admin.google.com/ac/billing/subscriptions?ecid=<customerId>`
+### 4.1 선택된 행 프로비저닝
 
-* Colab에서 상태 확인:
+**Netkiller → 선택된 행을 CONFIG로 실행**
 
-  ```python
-  sub = reseller.subscriptions().get(customerId=CUSTOMER_ID, subscriptionId=SUBSCRIPTION_ID).execute()
-  print(sub["status"])
-  ```
+* 현재 선택한 범위의 행만 실행
+* 실행 후 결과 컬럼 자동 기록
+
+### 4.2 전체 행 프로비저닝
+
+**Netkiller → 시트 전체를 CONFIG로 실행**
+
+* Provisioning 시트 전체 행 순회 실행
+* 실행 후 결과 컬럼 자동 기록
+
+### 4.3 전체 구독 플랜 전환
+
+**Netkiller → 전체 구독 전환 실행**
+
+* 각 행의 planName을 기준으로 플랜 전환 수행
+* customerId/subscriptionId 없으면 도메인으로 자동 탐색 후 기록
+* TRIAL이었다면 ANNUAL 전환 후 즉시 유료 시작
+
+### 4.4 설정 안내 메일 발송(선택행)
+
+**Netkiller → 선택된 행 설정 안내 메일 발송**
+
+* 선택된 행의 `contactEmail`로 안내 메일 전송
+* HTML + 플레인텍스트 동시 제공
 
 ---
 
-## 확장 아이디어
+## 5. 동작 흐름(프로비저닝)
 
-* 여러 고객 일괄 등록(batch provisioning)
-* 구독 자동 전환 (Trial → FLEXIBLE)
-* DNS TXT 자동 등록 API 연동 (Cloud DNS, Route53 등)
-* 에러 로깅 및 Slack 알림 통합
+1. `makeConfigFromRow_()`
+
+   * row → cfg 변환
+   * skuId 없으면 SKU_MAP으로 skuName 매핑
+   * planName, seats, languageCode 정리
+   * 4개 관리자 컬럼이 모두 있으면 `manageCustomerUsers=true`
+
+2. `runProvisioningOnce_(cfg)`
+
+   1. Site Verification 토큰 발급 시도(실패해도 계속 진행)
+   2. `ensureCustomer_byCfg_()`
+
+      * 고객 없으면 생성, 있으면 재사용
+   3. `setCustomerLanguage_(customerId, cfg.languageCode)`
+   4. `createSubscriptionIfAbsent_byCfg_()`
+
+      * TRIAL 생성 → 실패하면 FLEXIBLE로 재시도
+   5. (옵션) 관리자 사용자 생성/승격
+
+      * Users.insert → Users.makeAdmin
+      * 언어 설정 포함
+   6. `{customerId, sub}` 반환
+
+3. `writeProvisioningResult_()`
+
+   * 결과 컬럼 보장 후 customer/subscription 정보 기록
 
 ---
 
-## 라이선스
+## 6. 플랜 전환 로직
 
-이 노트북은 Google Codelab 기반 예시를 확장한 것으로,
-Google API Client Library for Python의 [Apache 2.0 License](https://www.apache.org/licenses/LICENSE-2.0)를 따릅니다.
+### 대상
+
+* planName이 **ANNUAL_MONTHLY_PAY** 또는 **ANNUAL_YEARLY_PAY** 일 때만 전환
+
+### 순서
+
+1. 현재 구독 조회 → TRIAL 여부 확인
+2. `setPlanForTrialOrFlex_()`
+
+   * changePlan(body, customerId, subscriptionId)
+3. 기존이 TRIAL이면 `startPaidService_()` 실행
+4. `setRenewalType_()` 로 갱신타입 반영
+5. 최신 구독 재조회 후 결과 컬럼 업데이트
 
 ---
 
-이 README를 `README.md` 파일로 저장해 드릴 수도 있습니다.
-원하시면 `.md` 파일로 만들어 드릴까요?
+## 7. 주의사항
+
+1. **FLEXIBLE 생성에 seats 금지**
+
+   * 코드에서 이미 방어하지만, 외부 수정 시 주의
+
+2. **planName은 Reseller 허용값만**
+
+   * 허용값:
+
+     * `TRIAL`
+     * `FLEXIBLE`
+     * `ANNUAL_MONTHLY_PAY`
+     * `ANNUAL_YEARLY_PAY`
+   * 별칭 일부 자동 매핑됨(ANNUAL, FLEX 등)
+
+3. **언어코드 포맷**
+
+   * 예: `ko`, `en`, `ja`, `zh-CN`
+   * 비어있으면 기본 `ko`
+
+4. **from alias 발송 조건**
+
+   ```js
+   from: 'support@netkiller.com'
+   ```
+
+   * 해당 alias가 Gmail에서 “보내는 주소”로 등록되어 있어야 동작
+
+5. **TRIAL 생성 불가 케이스**
+
+   * 이미 trial 종료/제한된 도메인 등
+   * 이 경우 자동으로 FLEXIBLE로 폴백
+
+---
+
+## 8. 트러블슈팅
+
+### Q1. `SKU_MAP에 'xxx' 매핑이 없습니다.`
+
+* SKU_MAP 시트에 skuName/skuId 행 추가 후 재실행
+
+### Q2. `Not Found`로 고객 조회 실패
+
+* customerDomain 오타/공백 확인
+* Reseller 파트너 계정에서 접근 가능한 도메인인지 확인
+
+### Q3. TRIAL 생성 실패 후 FLEXIBLE도 실패
+
+* 동일 SKU가 이미 존재하거나
+* 고객이 해당 SKU를 구매할 수 없는 상태일 수 있음
+* Reseller 콘솔에서 고객 상태와 SKU 권한 확인
+
+### Q4. startPaidService 실패
+
+* 이미 유료 상태이거나 TRIAL이 아닌데 호출된 케이스
+* 로그에서 `wasPlan`, `wasTrial` 확인
+
+### Q5. 메일 발송이 안 됨
+
+* contactEmail 비어있음
+* [support@netkiller.com](mailto:support@netkiller.com) alias 미등록
+* GmailApp 권한 미승인
+
+---
+
+## 9. 변경 이력(예시)
+
+* `v1` : 기본 고객+TRIAL 프로비저닝
+* `v2` :
+
+  * SKU_MAP 자동 매핑
+  * 언어 설정(테넌트/사용자)
+  * 결과 컬럼 자동 기록
+  * TRIAL→ANNUAL 전환 자동화
+  * 설정 안내 메일 발송 기능 추가
+
+---
+
+* Provisioning 시트 “샘플 템플릿(헤더+예시 행)”도 만들어 드릴게요.
+* README를 사내 위키 양식(Confluence/Notion)으로 맞춰 재정리도 가능!
